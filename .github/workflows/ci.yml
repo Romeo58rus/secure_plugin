@@ -1,0 +1,133 @@
+name: CI
+
+on: [push, pull_request]
+
+env:
+  GRADLE_OPTS: -Dhttp.keepAlive=false
+
+jobs:
+  build:
+    name: build
+    strategy:
+      fail-fast: false
+      matrix:
+        jdk: [11, 17]
+        platform: ["ubuntu-latest", "windows-latest", "macos-latest"]
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+    - name: Set up JDK for build and test
+      uses: actions/setup-java@v2
+      with:
+        distribution: temurin # Temurin is a distribution of adoptium
+        java-version: ${{ matrix.jdk }}
+
+    - name: Checkout security
+      uses: actions/checkout@v2
+
+    - name: Build and Test
+      uses: gradle/gradle-build-action@v2
+      with:
+        arguments: |
+          build test -Dbuild.snapshot=false
+          -x spotlessCheck
+          -x checkstyleMain
+          -x checkstyleTest
+          -x spotbugsMain
+
+    - name: Coverage
+      uses: codecov/codecov-action@v1
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: ./build/reports/jacoco/test/jacocoTestReport.xml
+
+    - uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: ${{ matrix.platform }}-JDK${{ matrix.jdk }}-reports
+        path: |
+          ./build/reports/
+
+    - name: check archive for debugging
+      if: always()
+      run: echo "Check the artifact ${{ matrix.platform }}-JDK${{ matrix.jdk }}-reports for detailed test results"
+
+  backward-compatibility:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/setup-java@v1
+      with:
+        java-version: 11
+    - run: ./gradlew clean build -Dbuild.snapshot=false -x test
+    - run: |
+        echo "Running backwards compatibility tests ..."
+        security_plugin_version_no_snapshot=$(./gradlew properties -q | grep -E '^version:' | awk '{print $2}' | sed 's/-SNAPSHOT//g')
+        bwc_version=2.4.0
+        cp -r build/ ./bwc-test/
+        mkdir ./bwc-test/src/test/resources/security_plugin_version_no_snapshot
+        cp build/distributions/opensearch-security-${security_plugin_version_no_snapshot}.zip ./bwc-test/src/test/resources/${security_plugin_version_no_snapshot}
+        mkdir bwc-test/src/test/resources/${bwc_version}.0
+        wget https://ci.opensearch.org/ci/dbc/distribution-build-opensearch/${bwc_version}/latest/linux/x64/tar/builds/opensearch/plugins/opensearch-security-${bwc_version}.0.zip
+        mv opensearch-security-${bwc_version}.0.zip bwc-test/src/test/resources/${bwc_version}.0/
+        cd bwc-test/
+        ./gradlew bwcTestSuite -Dtests.security.manager=false
+
+  code-ql:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/setup-java@v1
+      with:
+        java-version: 11
+    - uses: github/codeql-action/init@v1
+      with:
+        languages: java
+    - run: ./gradlew clean build -Dbuild.snapshot=false -x test
+    - uses: github/codeql-action/analyze@v1
+
+  build-artifact-names:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    - uses: actions/setup-java@v1
+      with:
+        java-version: 11
+
+    - run: |
+        security_plugin_version=$(./gradlew properties -q | grep -E '^version:' | awk '{print $2}')
+        security_plugin_version_no_snapshot=$(echo $security_plugin_version | sed 's/-SNAPSHOT//g')
+        security_plugin_version_only_number=$(echo $security_plugin_version_no_snapshot | cut -d- -f1)
+        test_qualifier=alpha2
+
+        echo "SECURITY_PLUGIN_VERSION=$security_plugin_version" >> $GITHUB_ENV
+        echo "SECURITY_PLUGIN_VERSION_NO_SNAPSHOT=$security_plugin_version_no_snapshot" >> $GITHUB_ENV
+        echo "SECURITY_PLUGIN_VERSION_ONLY_NUMBER=$security_plugin_version_only_number" >> $GITHUB_ENV
+        echo "TEST_QUALIFIER=$test_qualifier" >> $GITHUB_ENV
+
+    - run: |
+        echo ${{ env.SECURITY_PLUGIN_VERSION }}
+        echo ${{ env.SECURITY_PLUGIN_VERSION_NO_SNAPSHOT }}
+        echo ${{ env.SECURITY_PLUGIN_VERSION_ONLY_NUMBER }}
+        echo ${{ env.TEST_QUALIFIER }}
+
+    - run: ./gradlew clean assemble && test -s ./build/distributions/opensearch-security-${{ env.SECURITY_PLUGIN_VERSION }}.zip
+
+    - run: ./gradlew clean assemble -Dbuild.snapshot=false && test -s ./build/distributions/opensearch-security-${{ env.SECURITY_PLUGIN_VERSION_NO_SNAPSHOT }}.zip
+
+    - run: ./gradlew clean assemble -Dbuild.snapshot=false -Dbuild.version_qualifier=${{ env.TEST_QUALIFIER }} && test -s ./build/distributions/opensearch-security-${{ env.SECURITY_PLUGIN_VERSION_ONLY_NUMBER }}-${{ env.TEST_QUALIFIER }}.zip
+
+    - run: ./gradlew clean assemble -Dbuild.version_qualifier=${{ env.TEST_QUALIFIER }} && test -s ./build/distributions/opensearch-security-${{ env.SECURITY_PLUGIN_VERSION_ONLY_NUMBER }}-${{ env.TEST_QUALIFIER }}-SNAPSHOT.zip
+
+    - run:  |
+        ## EXISTING_OS_VERSION outputs the major version, example as 2
+        EXISTING_OS_VERSION=$(./gradlew properties | grep opensearch.version | cut -d':' -f2- | awk '{$1=$1};1' | cut -d '-' -f1 | cut -d '.' -f1)
+        ## INCREMENT_OS_VERSION in an increment of 1, example if EXISTING_OS_VERSION is 2, INCREMENT_OS_VERSION is 3
+        INCREMENT_OS_VERSION=$((++EXISTING_OS_VERSION)) 
+        ./gradlew clean updateVersion -DnewVersion=$INCREMENT_OS_VERSION.0.0-SNAPSHOT
+        test `./gradlew properties | grep opensearch.version | cut -d':' -f2- | awk '{$1=$1};1'` = $INCREMENT_OS_VERSION.0.0-SNAPSHOT
+
+    - name: List files in the build directory if there was an error
+      run: ls -al ./build/distributions/
+      if: failure()
