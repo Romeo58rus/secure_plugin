@@ -39,4 +39,5 @@ public interface SecurityKeyStore {
     public void initTransportSSLConfig();
     public X509Certificate[] getTransportCerts();
     public X509Certificate[] getHttpCerts();
+    public X509Certificate[] getCaCerts();
 }
